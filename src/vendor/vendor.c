@@ -107,14 +107,12 @@ int RDK_FactoryReset(void);
 int RdkResetInner(char *path, char *value, char *debug_msg);
 int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename);
 int Discover_AllDM(kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
-void Add_NameToDM(char *instantiated_path, rbusElementType_t type, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
+void Add_NameToDM(char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params);
 void Add_ObjectToDM(char *schema_path, char *write_status, kv_vector_t *rdk_objects);
 void Add_ParamToDM(char *instantiated_path, char *schema_path, char *write_status, kv_vector_t *rdk_params);
 void ConvertInstantiatedToSchemaPath(char *src, char *dest, int len);
 int WriteDMConfig(char *filename, char *mode, kv_vector_t *kvv, char *comment);
-void Add_MethodToDM(char *instantiated_path, kv_vector_t *rdk_objects);
-int RegisterRdkMethod(char *line, int line_number);
-int RDK_CheckMandatoryArgs(char *schema_path, kv_vector_t *input_args);
+int RegisterRdkMethod(char *filename);
 int RDK_InvokeRbusMethod(char *schema_path, char *method_path, kv_vector_t *input_args, kv_vector_t *output_args);
 int RDK_SyncOperate(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args);
 int RDK_AsyncOperate(dm_req_t *req, kv_vector_t *input_args, int instance);
@@ -132,7 +130,9 @@ int condition;
 static pthread_mutex_t mutex;
 static pthread_cond_t condition_var;
 static char shared_value[256];
-static kv_vector_t rdk_method_required_args = { NULL, 0 };
+
+//Store path and arg/type of input parameters as key value pairs for each RBUS method
+//This vector is needed to retrieve the type of input parameters during Method Invocation
 static kv_vector_t rdk_method_arg_types = { NULL, 0 };
 
 // Array of valid input arguments
@@ -429,6 +429,7 @@ int VENDOR_Init(void)
     char *usp_pa_dm_dir;
     char dm_objs_file[PATH_MAX];
     char dm_params_file[PATH_MAX];
+    char dm_commands_file[PATH_MAX];
 
     // Exit if unable to connect to the RDK message bus
     // NOTE: We do this here, rather than in VENDOR_Start() because the SerialNumber, ManufacturerOUI and SoftwareVersion are cached before USP_PA_Start() is called
@@ -449,7 +450,9 @@ int VENDOR_Init(void)
     // Create the data model config files, if they do not already exist
     USP_SNPRINTF(dm_objs_file, sizeof(dm_objs_file), "%s/usp_dm_objs.conf", usp_pa_dm_dir);
     USP_SNPRINTF(dm_params_file, sizeof(dm_params_file), "%s/usp_dm_params.conf", usp_pa_dm_dir);
-    if ((stat(dm_objs_file, &info) != 0) || (stat(dm_params_file, &info) != 0))
+    USP_SNPRINTF(dm_commands_file, sizeof(dm_commands_file), "%s/usp_dm_commands.conf", usp_pa_dm_dir);
+    if ((stat(dm_objs_file, &info) != 0) || (stat(dm_params_file, &info) != 0) ||
+        (stat(dm_commands_file, &info) != 0))
     {
         // Discover the data model objects and parameters
         USP_LOG_Info("%s: Regenerating missing USP data model config files. This may take a while.", __FUNCTION__);
@@ -463,6 +466,13 @@ int VENDOR_Init(void)
 
     // Exit if unable to register RDK data model objects
     err = RegisterRdkObjects(dm_objs_file);
+    if (err != USP_ERR_OK)
+    {
+        return err;
+    }
+
+    // Exit if unable to register RDK data model methods
+    err = RegisterRdkMethod(dm_commands_file);
     if (err != USP_ERR_OK)
     {
         return err;
@@ -730,10 +740,14 @@ exit:
 int RegisterRdkObjects(char *filename)
 {
     FILE *fp;
-    int line_number = 1, items_scanned, err, len;
-    char buf[MAX_LINE_LEN], path[MAX_LINE_LEN], writable_str[MAX_LINE_LEN];
+    int line_number = 1;
+    char buf[MAX_LINE_LEN];
+    char path[MAX_LINE_LEN];
+    char writable_str[MAX_LINE_LEN];
     bool is_writable;
     char *result;
+    int items_scanned;
+    int err;
 
     // Exit if unable to open the file specifying the data model
     fp = fopen(filename, "r");
@@ -751,20 +765,6 @@ int RegisterRdkObjects(char *filename)
         if ((buf[0]=='\0') || (buf[0]=='#') || (buf[0]=='\r') || (buf[0]=='\n'))
         {
             goto next_line;
-        }
-
-        if (sscanf(buf, "%s", path) == 1)
-        {
-            len = strlen(path);
-            if ((len >= 2) && (path[len-1] == ')') && (path[len-2] == '('))
-            {
-                err = RegisterRdkMethod(buf, line_number);
-                if (err != USP_ERR_OK)
-                {
-                    goto exit;
-                }
-                goto next_line;
-            }
         }
 
         // Exit if unable to read all details of the object to register
@@ -817,16 +817,18 @@ exit:
 **
 ** RdkArgTypeKeyword
 **
-** Maps a type keyword to the matching RBus value type. Unknown keywords default to RBUS_STRING.
+** Maps a type keyword to the matching RBUS value type. Unknown keywords default to RBUS_STRING.
 **
 ** \param   keyword - type keyword (e.g. "uint"), or NULL
 **
-** \return  the RBus value type to marshal the argument as
+** \return  the RBUS value type to marshal the argument as
 **
 **************************************************************************/
 static rbusValueType_t RdkArgTypeKeyword(const char *keyword)
 {
-    if (keyword == NULL)                      return RBUS_STRING;
+
+    // Return the RBUS type for the keyword
+    //Note: There can be no unknown type as type is validated while registering the method
     if (strcmp(keyword, "string")   == 0) return RBUS_STRING;
     if (strcmp(keyword, "uint")     == 0) return RBUS_UINT32;
     if (strcmp(keyword, "int")      == 0) return RBUS_INT32;
@@ -836,170 +838,251 @@ static rbusValueType_t RdkArgTypeKeyword(const char *keyword)
     if (strcmp(keyword, "datetime") == 0) return RBUS_DATETIME;
     if (strcmp(keyword, "hexbin")   == 0) return RBUS_BYTES;
 
-    USP_LOG_Warning("%s: Unknown method argument type '%s' in usp_dm_objs.conf, defaulting to string", __FUNCTION__, keyword);
+    // Return the default type if no match is found
     return RBUS_STRING;
 }
 
 /*********************************************************************//**
 **
-** RdkBuildArgTypeKey
+** RdkIsValidArgTypeKeyword
 **
-** Builds a normalised "<schema_path>_<arg_name>" lookup key for rdk_method_arg_types.
+** Returns whether a type keyword from usp_dm_commands.conf is supported.
 **
-** \param   out - buffer in which to return the key
-** \param   out_len - length of the output buffer
+** \param   keyword - type keyword (e.g. "uint"), must be non-NULL and non-empty
+**
+** \return  true if the keyword is valid
+**
+**************************************************************************/
+static bool RdkIsValidArgTypeKeyword(const char *keyword)
+{
+    // Exit if the keyword is NULL or empty
+    if ((keyword == NULL) || (*keyword == '\0'))
+    {
+        return false;
+    }
+
+    // Return true if the keyword is valid
+    if (strcmp(keyword, "string")   == 0) return true;
+    if (strcmp(keyword, "uint")     == 0) return true;
+    if (strcmp(keyword, "int")      == 0) return true;
+    if (strcmp(keyword, "ulong")    == 0) return true;
+    if (strcmp(keyword, "long")     == 0) return true;
+    if (strcmp(keyword, "bool")     == 0) return true;
+    if (strcmp(keyword, "datetime") == 0) return true;
+    if (strcmp(keyword, "hexbin")   == 0) return true;
+
+    return false;
+}
+
+/*********************************************************************//**
+**
+** RdkBuildMethodArgTypeKv
+**
+** Parses the method's stored IN_ARGS CSV once into a kv_vector of
+** schema-form argument name -> type keyword.
+**
 ** \param   schema_path - schema path of the method
-** \param   arg_name - name of the input argument
+** \param   arg_types - kv vector to initialise and fill (caller must USP_ARG_Destroy)
 **
 ** \return  None
 **
 **************************************************************************/
-static void RdkBuildArgTypeKey(char *out, int out_len, const char *schema_path, const char *arg_name)
+static void RdkBuildMethodArgTypeKv(char *schema_path, kv_vector_t *arg_types)
 {
-    char base[MAX_DM_PATH];
-    int n;
+    char *in_args_csv;
+    char *colon;
+    str_vector_t arg_tokens;
+    int i;
 
-    USP_STRNCPY(base, schema_path, sizeof(base));
-    n = (int) strlen(base);
-    while ((n > 0) && ((base[n-1] == ' ') || (base[n-1] == '\t') || (base[n-1] == '\r') || (base[n-1] == '\n')))
+    USP_ARG_Init(arg_types);
+
+    // Exit if the arg_types is NULL, has no entries, or the schema_path is NULL
+    if ((rdk_method_arg_types.num_entries == 0) || (schema_path == NULL))
     {
-        base[--n] = '\0';   // trim trailing whitespace
+        return;
     }
-    if ((n >= 2) && (base[n-1] == ')') && (base[n-2] == '('))
+
+    // Get the IN_ARGS CSV for the method
+    in_args_csv = USP_ARG_Get(&rdk_method_arg_types, schema_path, NULL);
+    if (in_args_csv == NULL)
     {
-        base[n-2] = '\0';   // drop trailing "()" so the key is independent of its presence
+        return;
     }
-    USP_SNPRINTF(out, out_len, "%s_%s", base, arg_name);
+
+    // Split the IN_ARGS CSV into tokens
+    STR_VECTOR_Init(&arg_tokens);
+    TEXT_UTILS_SplitString(in_args_csv, &arg_tokens, ",");
+
+    // For each token, split it into name and type, then it add to the arg_types kv vector as key and value respectively
+    for (i = 0; i < arg_tokens.num_entries; i++)
+    {
+        colon = strchr(arg_tokens.vector[i], ':');
+        if (colon == NULL)
+        {
+            continue;
+        }
+        *colon = '\0';
+        USP_ARG_Add(arg_types, arg_tokens.vector[i], colon + 1);
+    }
+    STR_VECTOR_Destroy(&arg_tokens);
 }
 
 /*********************************************************************//**
 **
 ** RdkLookupMethodArgType
 **
-** Returns the RBus type for a method input argument from usp_dm_objs.conf ":type" overrides.
+** Returns the RBUS type for a method input argument from a pre-built
+** name->type kv_vector (see RdkBuildMethodArgTypeKv).
 **
-** \param   schema_path - schema path of the method (eg Device....Radio.{i}.ChannelScanRequest())
-** \param   arg_name - name of the input argument
+** \param   arg_types - kv vector of schema arg name -> type keyword
+** \param   arg_name - instantiated input argument name
 **
-** \return  the RBus value type to use
+** \return  the RBUS value type to use
 **
 **************************************************************************/
-static rbusValueType_t RdkLookupMethodArgType(char *schema_path, char *arg_name)
+static rbusValueType_t RdkLookupMethodArgType(kv_vector_t *arg_types, char *arg_name)
 {
-    char key[MAX_DM_PATH + 64], arg_schema[MAX_DM_PATH];
-    char *keyword;
+    char arg_schema[MAX_DM_PATH];
+    char *type;
 
-    if ((rdk_method_arg_types.num_entries == 0) || (schema_path == NULL))
+    // Exit if the arg_types is NULL, has no entries, or the arg_name is NULL
+    if ((arg_types == NULL) || (arg_types->num_entries == 0) || (arg_name == NULL))
     {
         return RBUS_STRING;
     }
 
+    // Convert the argument name to schema form
     TEXT_UTILS_PathToSchemaForm(arg_name, arg_schema, sizeof(arg_schema));
-    RdkBuildArgTypeKey(key, sizeof(key), schema_path, arg_schema);
-    keyword = USP_ARG_Get(&rdk_method_arg_types, key, NULL);
-    return RdkArgTypeKeyword(keyword);
+
+    // Lookup the type for the argument and return the RBUS value type
+    // Note: By Default, RBUS_STRING is returned if the type is not found
+    type = USP_ARG_Get(arg_types, arg_schema, NULL);
+    if (type == NULL)
+    {
+        return RBUS_STRING;
+    }
+    return RdkArgTypeKeyword(type);
 }
 
 /*********************************************************************//**
 **
-** RdkStripArgTypes
+** RdkValidateAndStripArgs
 **
-** Strips ":type" suffixes from argument tokens and records the parsed types for marshalling.
+** Validates argument type suffixes, then strips ":type" leaving only argument names.
 **
-** \param   schema_path - schema path of the method (used as the type-map key prefix)
-** \param   sv - vector of "name" or "name:type" argument tokens (modified in place)
+** \param   sv - vector of "name:type" argument tokens (modified in place)
+** \param   path - method path (for error reporting)
+** \param   line_number - line number in the file (for error reporting)
 **
-** \return  None
+** \return  USP_ERR_OK if all declared types are valid
 **
 **************************************************************************/
-static void RdkStripArgTypes(char *schema_path, str_vector_t *sv)
+static int RdkValidateAndStripArgs(str_vector_t *sv, char *path, int line_number)
 {
     int i;
-    char *colon, *type, key[MAX_DM_PATH + 64];
+    char *colon;
+    char *type;
 
+    // Validate each argument "name:type", then strip type so only the name remains
     for (i = 0; i < sv->num_entries; i++)
     {
         colon = strchr(sv->vector[i], ':');
         if (colon == NULL)
         {
-            continue;
+            USP_ERR_SetMessage("%s: Method %s on line %d argument '%s' has no type suffix", __FUNCTION__, path,
+                line_number, sv->vector[i]);
+            return USP_ERR_INTERNAL_ERROR;
         }
-        *colon = '\0';   // truncate the token to just the argument name
-
         type = colon + 1;
-        while (*type == ' ')
-        {
-            type++;
-        }
+
+        // Exit if the type is empty
         if (*type == '\0')
         {
-            continue;
+            USP_ERR_SetMessage("%s: Method %s on line %d has empty type for argument '%.*s'", __FUNCTION__, path,
+                line_number, (int) (colon - sv->vector[i]), sv->vector[i]);
+            return USP_ERR_INTERNAL_ERROR;
         }
-        if (rdk_method_arg_types.num_entries == 0)
+
+        // Exit if the type is invalid
+        if (RdkIsValidArgTypeKeyword(type) == false)
         {
-            USP_ARG_Init(&rdk_method_arg_types);
+            USP_ERR_SetMessage("%s: Method %s on line %d has invalid type '%s' for argument '%.*s' "
+                               "(valid: string,uint,int,ulong,long,bool,datetime,hexbin)",
+                               __FUNCTION__, path, line_number, type, (int) (colon - sv->vector[i]), sv->vector[i]);
+            return USP_ERR_INTERNAL_ERROR;
         }
-        RdkBuildArgTypeKey(key, sizeof(key), schema_path, sv->vector[i]);
-        USP_ARG_Add(&rdk_method_arg_types, key, type);
+        *colon = '\0';
     }
+    return USP_ERR_OK;
 }
 
 /*********************************************************************//**
 **
 ** KvToRbusObject
 **
-** Converts a USP kv_vector_t into an rbusObject_t using declared per-argument RBus types.
+** Converts a USP kv_vector_t into an rbusObject_t using declared per-argument RBUS types.
 **
 ** \param   schema_path - schema path of the method (used to look up per-argument type overrides)
 ** \param   args - key-value vector of arguments (may be NULL)
-** \param   out_obj - pointer in which to return the created RBus object (caller must release)
 **
-** \return  None
+** \return  rbusObject_t if successful, NULL otherwise
 **
 **************************************************************************/
-static void KvToRbusObject(char *schema_path, kv_vector_t *args, rbusObject_t *rbus_obj)
+static rbusObject_t KvToRbusObject(char *schema_path, kv_vector_t *args)
 {
     int i;
     rbusObject_t obj = NULL;
     rbusValue_t val;
     rbusValueType_t type;
+    kv_vector_t arg_types;
 
     rbusObject_Init(&obj, NULL);
     if (args != NULL)
     {
+        /* Build the arg_types kv vector once for this method */
+        RdkBuildMethodArgTypeKv(schema_path, &arg_types);
+
+        // Convert each USP input arg to a typed RBUS value
         for (i = 0; i < args->num_entries; i++)
         {
             if (strcmp(args->vector[i].key, SAVED_TIME_REF_ARG_NAME) == 0)
             {
                 continue;
             }
+
             rbusValue_Init(&val);
-            type = RdkLookupMethodArgType(schema_path, args->vector[i].key);
+
+            // Lookup the RBUS type for the argument and set the value according to type
+            type = RdkLookupMethodArgType(&arg_types, args->vector[i].key);
             if (type == RBUS_STRING)
             {
                 rbusValue_SetString(val, args->vector[i].value);
             }
             else if (rbusValue_SetFromString(val, type, args->vector[i].value) == false)
             {
-                USP_LOG_Warning("%s: Could not convert argument '%s'='%s' to the declared type, sending as string",
-                                __FUNCTION__, args->vector[i].key, args->vector[i].value);
-                rbusValue_SetString(val, args->vector[i].value);
+                USP_LOG_Warning("%s: Could not convert argument '%s'='%s' to declared type, aborting invoke",
+                    __FUNCTION__, args->vector[i].key, args->vector[i].value);
+                rbusValue_Release(val);
+                rbusObject_Release(obj);
+                USP_ARG_Destroy(&arg_types);
+                return NULL;
             }
-            USP_LOG_Info("%s: Adding input argument %s=%s type:%d", __FUNCTION__, args->vector[i].key, args->vector[i].value, type);
             rbusObject_SetValue(obj, args->vector[i].key, val);
             rbusValue_Release(val);
         }
+
+        USP_ARG_Destroy(&arg_types);
     }
-    *rbus_obj = obj;
+    return obj;
 }
 
 /*********************************************************************//**
 **
 ** RbusObjectToKv
 **
-** Copies all properties of an RBus object into a USP key-value argument vector (as strings).
+** Copies all properties of an RBUS object into a USP key-value argument vector (as strings).
 **
-** \param   obj - RBus object returned by the method (may be NULL)
+** \param   obj - RBUS object returned by the method (may be NULL)
 ** \param   args - key-value vector to add the output arguments to
 **
 ** \return  None
@@ -1011,18 +1094,25 @@ static void RbusObjectToKv(rbusObject_t obj, kv_vector_t *args)
     rbusValue_t val;
     char *str;
 
+    // Exit if the object is NULL
     if (obj == NULL)
     {
         return;
     }
 
+    // For every output argument in the object, copy the name and value to the args kv vector as key and value respectively
     prop = rbusObject_GetProperties(obj);
     while (prop != NULL)
     {
         val = rbusProperty_GetValue(prop);
-        str = (val != NULL) ? rbusValue_ToString(val, NULL, 0) : NULL;
-        USP_ARG_Add(args, (char *)rbusProperty_GetName(prop), (str != NULL) ? str : "");
-        USP_SAFE_FREE(str);
+        if(val != NULL) {
+            str = rbusValue_ToString(val, NULL, 0);
+            USP_ARG_Add(args, (char *)rbusProperty_GetName(prop), (str != NULL) ? str : "");
+            free(str);
+        }
+        else {
+            USP_LOG_Warning("%s: Failed to convert output argument '%s' to a string", __FUNCTION__, rbusProperty_GetName(prop));
+        }
         prop = rbusProperty_GetNext(prop);
     }
 }
@@ -1031,7 +1121,7 @@ static void RbusObjectToKv(rbusObject_t obj, kv_vector_t *args)
 **
 ** RDK_InvokeRbusMethod
 **
-** Invokes an RBus method via rbusMethod_Invoke and copies output arguments back.
+** Invokes an RBUS method via rbusMethod_Invoke and copies output arguments back.
 **
 ** \param   schema_path - schema path of the method (used to look up per-argument type overrides)
 ** \param   method_path - instantiated method path to invoke (e.g. Device.X_RDK_Foo())
@@ -1043,22 +1133,32 @@ static void RbusObjectToKv(rbusObject_t obj, kv_vector_t *args)
 **************************************************************************/
 int RDK_InvokeRbusMethod(char *schema_path, char *method_path, kv_vector_t *input_args, kv_vector_t *output_args)
 {
-    rbusObject_t in_obj = NULL, out_obj = NULL;
+    rbusObject_t in_obj = NULL;
+    rbusObject_t out_obj = NULL;
     rbusError_t rc;
     int len;
     char alt_path[MAX_DM_PATH];
 
+    // Exit if the bus handle is NULL
     if (bus_handle == NULL)
     {
         USP_ERR_SetMessage("%s: called before connected to R-Bus", __FUNCTION__);
         return USP_ERR_INTERNAL_ERROR;
     }
 
-    KvToRbusObject(schema_path, input_args, &in_obj);
+    // Build RBUS input object and invoke the method
+    in_obj = KvToRbusObject(schema_path, input_args);
+    if (in_obj == NULL)
+    {
+        USP_ERR_SetMessage("%s: Failed to convert input arguments for %s", __FUNCTION__, method_path);
+        return USP_ERR_INVALID_ARGUMENTS;
+    }
 
+    // Invoke the method and release the input object
     rc = rbusMethod_Invoke(bus_handle, method_path, in_obj, &out_obj);
 
-    // Retry without trailing "()" if provider registered the bare method name
+    //Fallback: RBUS method can be registered without the trailing '()', in that case RBUS Method will succeed from device side, but usp-pa will fail.
+    //Even without the trailing '()', RBUS Method Invocation should succeed.
     if ((rc == RBUS_ERROR_DESTINATION_NOT_FOUND) || (rc == RBUS_ERROR_INVALID_METHOD))
     {
         len = strlen(method_path);
@@ -1082,6 +1182,7 @@ int RDK_InvokeRbusMethod(char *schema_path, char *method_path, kv_vector_t *inpu
 
     rbusObject_Release(in_obj);
 
+    // Propagate RBUS failure to USP
     if (rc != RBUS_ERROR_SUCCESS)
     {
         USP_ERR_SetMessage("%s: rbusMethod_Invoke(%s) failed (%d - %s)", __FUNCTION__, method_path, rc, rbusError_ToString(rc));
@@ -1092,10 +1193,13 @@ int RDK_InvokeRbusMethod(char *schema_path, char *method_path, kv_vector_t *inpu
         return USP_ERR_COMMAND_FAILURE;
     }
 
+    // Copy RBUS outputs into USP arg vector
     if (output_args != NULL)
     {
         RbusObjectToKv(out_obj, output_args);
     }
+
+    // Release the output object
     if (out_obj != NULL)
     {
         rbusObject_Release(out_obj);
@@ -1106,70 +1210,9 @@ int RDK_InvokeRbusMethod(char *schema_path, char *method_path, kv_vector_t *inpu
 
 /*********************************************************************//**
 **
-** RDK_CheckMandatoryArgs
-**
-** Verifies all IN_REQ arguments declared in usp_dm_objs.conf are present in the input.
-**
-** \param   schema_path - schema path of the method being invoked (dm_req_t.schema_path)
-** \param   input_args - key-value vector of input arguments supplied by the controller
-**
-** \return  USP_ERR_OK if all mandatory arguments are present
-**
-**************************************************************************/
-int RDK_CheckMandatoryArgs(char *schema_path, kv_vector_t *input_args)
-{
-    char *required_csv;
-    char buf[512], arg_schema[MAX_DM_PATH];
-    str_vector_t req_templates;
-    int i, req_idx;
-    bool found;
-
-    if (rdk_method_required_args.num_entries == 0)
-    {
-        return USP_ERR_OK;
-    }
-
-    required_csv = USP_ARG_Get(&rdk_method_required_args, schema_path, NULL);
-    if (required_csv == NULL)
-    {
-        return USP_ERR_OK;
-    }
-
-    USP_STRNCPY(buf, required_csv, sizeof(buf));
-    STR_VECTOR_Init(&req_templates);
-    TEXT_UTILS_SplitString(buf, &req_templates, ",");
-
-    for (req_idx = 0; req_idx < req_templates.num_entries; req_idx++)
-    {
-        found = false;
-        for (i = 0; i < input_args->num_entries; i++)
-        {
-            TEXT_UTILS_PathToSchemaForm(input_args->vector[i].key, arg_schema, sizeof(arg_schema));
-            if (strcmp(arg_schema, req_templates.vector[req_idx]) == 0)
-            {
-                found = true;
-                break;
-            }
-        }
-
-        if (found == false)
-        {
-            USP_ERR_SetMessage("%s: Mandatory input argument '%s' is missing for %s", __FUNCTION__,
-                               req_templates.vector[req_idx], schema_path);
-            STR_VECTOR_Destroy(&req_templates);
-            return USP_ERR_COMMAND_FAILURE;
-        }
-    }
-
-    STR_VECTOR_Destroy(&req_templates);
-    return USP_ERR_OK;
-}
-
-/*********************************************************************//**
-**
 ** RDK_SyncOperate
 **
-** Synchronous USP command handler that forwards to RBus and returns output inline.
+** Synchronous USP command handler that forwards to RBUS and returns output inline.
 **
 ** \param   req - pointer to structure identifying the operation (req->path is the invoked path)
 ** \param   command_key - command key supplied by the controller (unused - handled by the core)
@@ -1181,14 +1224,7 @@ int RDK_CheckMandatoryArgs(char *schema_path, kv_vector_t *input_args)
 **************************************************************************/
 int RDK_SyncOperate(dm_req_t *req, char *command_key, kv_vector_t *input_args, kv_vector_t *output_args)
 {
-    int err;
-
-    err = RDK_CheckMandatoryArgs(req->schema_path, input_args);
-    if (err != USP_ERR_OK)
-    {
-        return err;
-    }
-
+    // Invoke the RBUS method and return the output arguments
     return RDK_InvokeRbusMethod(req->schema_path, req->path, input_args, output_args);
 }
 
@@ -1196,7 +1232,7 @@ int RDK_SyncOperate(dm_req_t *req, char *command_key, kv_vector_t *input_args, k
 **
 ** RDK_AsyncOperateThread
 **
-** Worker thread that invokes an async RBus method and signals completion with output args.
+** Worker thread that invokes an async RBUS method and signals completion with output args.
 **
 ** \param   param - pointer to an rdk_async_oper_ctx_t (ownership passed to this thread)
 **
@@ -1207,14 +1243,16 @@ void *RDK_AsyncOperateThread(void *param)
 {
     rdk_async_oper_ctx_t *ctx = (rdk_async_oper_ctx_t *) param;
     kv_vector_t *output_args;
-    int i, err;
+    int i;
+    int err;
     char *err_msg;
 
+    // Invoke RBUS method on worker thread
     output_args = USP_ARG_Create();
-
     err = RDK_InvokeRbusMethod(ctx->schema_path, ctx->path, &ctx->input_args, output_args);
     err_msg = (err != USP_ERR_OK) ? USP_ERR_GetMessage() : NULL;
 
+    // output arguments will be logged to /var/log/syslog if log level is Info or higher
     if (output_args->num_entries == 0)
     {
         USP_LOG_Info("%s: Method %s returned no output arguments", __FUNCTION__, ctx->path);
@@ -1227,6 +1265,7 @@ void *RDK_AsyncOperateThread(void *param)
         }
     }
 
+    // Notify DM thread; ownership of output_args passes to USP core
     USP_SIGNAL_OperationComplete(ctx->instance, err, err_msg, output_args);
 
     USP_ARG_Destroy(&ctx->input_args);
@@ -1238,7 +1277,7 @@ void *RDK_AsyncOperateThread(void *param)
 **
 ** RDK_AsyncOperate
 **
-** Starts a worker thread to invoke an async RBus method without blocking the DM thread.
+** Starts a worker thread to invoke an async RBUS method without blocking the DM thread.
 **
 ** \param   req - pointer to structure identifying the operation (req->path is the invoked path)
 ** \param   input_args - vector containing input arguments and their values
@@ -1252,18 +1291,15 @@ int RDK_AsyncOperate(dm_req_t *req, kv_vector_t *input_args, int instance)
     int i, err;
     rdk_async_oper_ctx_t *ctx;
 
-    err = RDK_CheckMandatoryArgs(req->schema_path, input_args);
-    if (err != USP_ERR_OK)
-    {
-        return err;
-    }
-
+    // Copy the request context for the worker thread
     ctx = USP_MALLOC(sizeof(rdk_async_oper_ctx_t));
     memset(ctx, 0, sizeof(rdk_async_oper_ctx_t));
     ctx->instance = instance;
     USP_STRNCPY(ctx->path, req->path, sizeof(ctx->path));
     USP_STRNCPY(ctx->schema_path, req->schema_path, sizeof(ctx->schema_path));
     USP_ARG_Init(&ctx->input_args);
+
+    // Copy the input arguments to the worker thread context
     if (input_args != NULL)
     {
         for (i = 0; i < input_args->num_entries; i++)
@@ -1272,6 +1308,7 @@ int RDK_AsyncOperate(dm_req_t *req, kv_vector_t *input_args, int instance)
         }
     }
 
+    // Hand off to worker; free ctx if thread create fails
     err = OS_UTILS_CreateThread("rdk_method", RDK_AsyncOperateThread, ctx);
     if (err != USP_ERR_OK)
     {
@@ -1285,52 +1322,9 @@ int RDK_AsyncOperate(dm_req_t *req, kv_vector_t *input_args, int instance)
 
 /*********************************************************************//**
 **
-** Add_MethodToDM
+** RegisterRdkMethodLine
 **
-** Records a discovered RBus method in rdk_objects as SYNC for writing to usp_dm_objs.conf.
-**
-** \param   instantiated_path - instantiated method name reported by RBus
-** \param   rdk_objects - key value vector of data model objects (methods are written here too)
-**
-** \return  None
-**
-**************************************************************************/
-void Add_MethodToDM(char *instantiated_path, kv_vector_t *rdk_objects)
-{
-    char schema_path[MAX_DM_PATH];
-    int len;
-
-    ConvertInstantiatedToSchemaPath(instantiated_path, schema_path, sizeof(schema_path));
-
-    len = strlen(schema_path);
-    if (len < 4)
-    {
-        return;
-    }
-
-    if (!((len >= 2) && (schema_path[len-1] == ')') && (schema_path[len-2] == '(')))
-    {
-        if ((len + 2) < (int)sizeof(schema_path))
-        {
-            schema_path[len]   = '(';
-            schema_path[len+1] = ')';
-            schema_path[len+2] = '\0';
-        }
-    }
-
-    if (USP_ARG_Get(rdk_objects, schema_path, NULL) != NULL)
-    {
-        return;
-    }
-
-    USP_ARG_Add(rdk_objects, schema_path, "ASYNC");
-}
-
-/*********************************************************************//**
-**
-** RegisterRdkMethod
-**
-** Parses a "<path>() <SYNC|ASYNC> [IN_REQ:..] [IN_OPT:..] [OUT:..]" line and registers the method.
+** Parses a "<path>() <SYNC|ASYNC> [IN_ARGS-..] [OUT-..]" line and registers the method.
 **
 ** \param   line - the full config line for the method
 ** \param   line_number - line number in the file (for error reporting)
@@ -1338,31 +1332,38 @@ void Add_MethodToDM(char *instantiated_path, kv_vector_t *rdk_objects)
 ** \return  USP_ERR_OK if successful
 **
 **************************************************************************/
-int RegisterRdkMethod(char *line, int line_number)
+static int RegisterRdkMethodLine(char *line, int line_number)
 {
-    char line_copy[MAX_LINE_LEN], required_csv[512];
-    char *path, *sync_async, *tok;
-    str_vector_t in_args, out_args, req_args, line_tokens;
-    int i, err;
+    char path[MAX_DM_PATH] = "";
+    char sync_async[6] = "";
+    char in_args_str[MAX_DM_VALUE_LEN] = "";
+    char out_args_str[MAX_DM_VALUE_LEN] = "";
+    str_vector_t in_args;
+    str_vector_t out_args;
+    int err;
+    int items_scanned;
+    int len;
     bool is_async;
 
-    USP_STRNCPY(line_copy, line, sizeof(line_copy));
     STR_VECTOR_Init(&in_args);
     STR_VECTOR_Init(&out_args);
-    STR_VECTOR_Init(&req_args);
-    STR_VECTOR_Init(&line_tokens);
-    TEXT_UTILS_SplitString(line_copy, &line_tokens, " ");
 
-    if (line_tokens.num_entries < 2)
+    // Parse "<path>() <SYNC|ASYNC> [IN_ARGS-..] [OUT-..]"
+    items_scanned = sscanf(line, "%255s %5s %4095s %4095s", path, sync_async, in_args_str, out_args_str);
+    if (items_scanned < 2)
     {
-        USP_ERR_SetMessage("%s: Malformed method line %d (expected: <path>() <SYNC|ASYNC> [IN_REQ:..] [IN_OPT:..] [OUT:..])", __FUNCTION__, line_number);
+        goto malformed;
+    }
+
+    // Path must end with "()"
+    len = strlen(path);
+    if (!((len >= 6) && (path[len-1] == ')') && (path[len-2] == '('))) {
+        USP_ERR_SetMessage("%s: Incorrect method path %s on line %d", __FUNCTION__, path, line_number);
         err = USP_ERR_INTERNAL_ERROR;
         goto exit;
     }
 
-    path = line_tokens.vector[0];
-    sync_async = line_tokens.vector[1];
-
+    // Resolve SYNC vs ASYNC handler
     if (strcmp(sync_async, "ASYNC") == 0)
     {
         is_async = true;
@@ -1378,33 +1379,70 @@ int RegisterRdkMethod(char *line, int line_number)
         goto exit;
     }
 
-    for (i = 2; i < line_tokens.num_entries; i++)
+    // Validate and split the 3rd item to IN_ARGS- or Copy it to OUT_ARGS if it is OUT-
+    //Note: In few Methods, IN_ARGS is not available. So, 3rd item will be OUT_ARGS
+    if (in_args_str[0] != '\0')
     {
-        tok = line_tokens.vector[i];
-        if (strncmp(tok, "IN_REQ:", 7) == 0)
+        if (strncmp(in_args_str, "IN_ARGS-", 8) == 0)
         {
-            TEXT_UTILS_SplitString(&tok[7], &in_args, ",");
-            TEXT_UTILS_SplitString(&tok[7], &req_args, ",");
+            if (in_args_str[8] == '\0')
+            {
+                goto malformed;
+            }
+            TEXT_UTILS_SplitString(&in_args_str[8], &in_args, ",");
+
+            // Validate and strip input arguments for registration
+            err = RdkValidateAndStripArgs(&in_args, path, line_number);
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
+            }
         }
-        else if (strncmp(tok, "IN_OPT:", 7) == 0)
+        else if (strncmp(in_args_str, "OUT-", 4) == 0)
         {
-            TEXT_UTILS_SplitString(&tok[7], &in_args, ",");
-        }
-        else if (strncmp(tok, "OUT:", 4) == 0)
-        {
-            TEXT_UTILS_SplitString(&tok[4], &out_args, ",");
+            if (in_args_str[4] == '\0')
+            {
+                goto malformed;
+            }
+            USP_STRNCPY(out_args_str, in_args_str, sizeof(out_args_str));
         }
         else
         {
-            USP_LOG_Warning("%s: Ignoring unrecognised token '%s' on method line %d", __FUNCTION__, tok, line_number);
+            goto malformed;
         }
     }
 
-    // Strip ":type" suffixes and record RBus types for marshalling.
-    RdkStripArgTypes(path, &in_args);
-    RdkStripArgTypes(path, &req_args);
-    RdkStripArgTypes(path, &out_args);
+    // If 4th item is available, validate and split it to OUT-
+    if (out_args_str[0] != '\0')
+    {
+        if (strncmp(out_args_str, "OUT-", 4) == 0)
+        {
+            if (out_args_str[4] == '\0')
+            {
+                goto malformed;
+            }
+            TEXT_UTILS_SplitString(&out_args_str[4], &out_args, ",");
 
+            // Validate and strip output arguments for registration
+            err = RdkValidateAndStripArgs(&out_args, path, line_number);
+            if (err != USP_ERR_OK)
+            {
+                goto exit;
+            }
+        }
+        else
+        {
+            goto malformed;
+        }
+    }
+
+    // Store CSV under method schema path
+    if ((strncmp(in_args_str, "IN_ARGS-", 8) == 0) && (in_args_str[8] != '\0'))
+    {
+        USP_ARG_Add(&rdk_method_arg_types, path, in_args_str + 8);
+    }
+
+    // Register command handler and declared argument names
     if (is_async)
     {
         err = USP_REGISTER_AsyncOperation(path, RDK_AsyncOperate, NULL);
@@ -1413,38 +1451,92 @@ int RegisterRdkMethod(char *line, int line_number)
     {
         err = USP_REGISTER_SyncOperation(path, RDK_SyncOperate);
     }
+
+    // Exit if the command handler registration failed
     if (err != USP_ERR_OK)
     {
         goto exit;
     }
 
-    err = USP_REGISTER_OperationArguments(path, (in_args.num_entries  > 0) ? in_args.vector  : NULL, in_args.num_entries,
-                                                (out_args.num_entries > 0) ? out_args.vector : NULL, out_args.num_entries);
+    // Register the operation arguments
+    err = USP_REGISTER_OperationArguments(path, in_args.vector, in_args.num_entries, out_args.vector, out_args.num_entries);
     if (err != USP_ERR_OK)
     {
         goto exit;
     }
 
-    if (req_args.num_entries > 0)
-    {
-        TEXT_UTILS_ListToString(req_args.vector, req_args.num_entries, required_csv, sizeof(required_csv));
+    USP_LOG_Info("%s: Registered %s method %s (%d in, %d out)", __FUNCTION__, is_async ? "ASYNC" : "SYNC", path, in_args.num_entries,
+        out_args.num_entries);
+    err = USP_ERR_OK;
+    goto exit;
 
-        if (rdk_method_required_args.num_entries == 0)
+malformed:
+    USP_ERR_SetMessage("%s: Malformed method line %d input:%s (expected: <path>() <SYNC|ASYNC> [IN_ARGS-..] [OUT-..])",
+                       __FUNCTION__, line_number, line);
+    err = USP_ERR_INTERNAL_ERROR;
+
+exit:
+    STR_VECTOR_Destroy(&in_args);
+    STR_VECTOR_Destroy(&out_args);
+    return err;
+}
+
+/*********************************************************************//**
+**
+** RegisterRdkMethod
+**
+** Registers all RDK data model methods specified in the given filename.
+**
+** \param   filename - name of file specifying the data model methods
+**
+** \return  USP_ERR_OK if successful
+**
+**************************************************************************/
+int RegisterRdkMethod(char *filename)
+{
+    FILE *fp;
+    int line_number = 1;
+    int err;
+    char buf[MAX_LINE_LEN];
+    char *result;
+
+    // Missing commands file is non-fatal
+    fp = fopen(filename, "r");
+    if (fp == NULL)
+    {
+        USP_LOG_Info("%s: No RDK commands file (%s), skipping method registration", __FUNCTION__, filename);
+        return USP_ERR_OK;
+    }
+
+    // Register one method per non-empty, non-comment line
+    result = fgets(buf, sizeof(buf), fp);
+    while (result != NULL)
+    {
+        char *line;
+        line = TEXT_UTILS_TrimBuffer(buf);
+
+        // Skip empty lines, comments, and newlines
+        if ((line[0] == '\0') || (line[0] == '#') || (line[0] == '\n'))
         {
-            USP_ARG_Init(&rdk_method_required_args);
+            goto next_line;
         }
-        USP_ARG_Add(&rdk_method_required_args, path, required_csv);
-    }
 
-    USP_LOG_Info("%s: Registered %s method %s (%d in, %d out, %d mandatory)", __FUNCTION__, is_async ? "ASYNC" : "SYNC", path, in_args.num_entries,
-        out_args.num_entries, req_args.num_entries);
+        // Register the method
+        err = RegisterRdkMethodLine(line, line_number);
+        if (err != USP_ERR_OK)
+        {
+            goto exit;
+        }
+
+next_line:
+        line_number++;
+        result = fgets(buf, sizeof(buf), fp);
+    }
     err = USP_ERR_OK;
 
 exit:
-    STR_VECTOR_Destroy(&line_tokens);
-    STR_VECTOR_Destroy(&in_args);
-    STR_VECTOR_Destroy(&out_args);
-    STR_VECTOR_Destroy(&req_args);
+    fclose(fp);
+
     return err;
 }
 
@@ -2221,9 +2313,7 @@ int DiscoverDM_ForAllComponents(char *objs_filename, char *params_filename)
     // Exit if unable to write either of the files successfully
     err = USP_ERR_OK;
     err |= WriteDMConfig(params_filename, "w", &rdk_params, "# Configuration file for data model parameters accessible over USP\n");
-    err |= WriteDMConfig(objs_filename, "w", &rdk_objects, "# Configuration file for data model objects and methods accessible over USP\n# "
-        "Method lines: <path>() <SYNC|ASYNC> [IN_REQ:a,b] [IN_OPT:c,d] [OUT:e,f]\n# Input args may add an optional :type (int,uint,long,ulong,bool,datetime,hexbin);"
-        "default is string. Eg IN_REQ:OpClass:uint,ChannelList:string\n");
+    err |= WriteDMConfig(objs_filename, "w", &rdk_objects, "# Configuration file for data model objects accessible over USP\n");
     if (err != USP_ERR_OK)
     {
         err = USP_ERR_INTERNAL_ERROR;
@@ -2282,7 +2372,7 @@ int Discover_AllDM(kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
         }
         if (c1)
         {
-            Add_NameToDM((char *)elem->name, elem->type, write_status, rdk_objects, rdk_params);
+            Add_NameToDM((char *)elem->name, write_status, rdk_objects, rdk_params);
         }
         elem = elem->next;
     }
@@ -2299,11 +2389,10 @@ int Discover_AllDM(kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
 **
 ** Add_NameToDM
 **
-** Adds the specified path (object, parameter or method) to the relevant key-value vector
+** Adds the specified path (object or parameter) to the relevant key-value vector
 **
 ** \param   rdkc - component providing part of the data model
 ** \param   instantiated_path - Instantiated data model path of the parameter or object to add
-** \param   type - RBus element type, used to route methods to Add_MethodToDM
 ** \param   write_status - whether the parameter or object is read only or writable
 ** \param   rdk_objects - key value vector of data model object path vs properties
 ** \param   rdk_params - key value vector of data model parameter path vs properties
@@ -2311,16 +2400,10 @@ int Discover_AllDM(kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
 ** \return  None
 **
 **************************************************************************/
-void Add_NameToDM(char *instantiated_path, rbusElementType_t type, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
+void Add_NameToDM( char *instantiated_path, char *write_status, kv_vector_t *rdk_objects, kv_vector_t *rdk_params)
 {
     char schema_path[MAX_DM_PATH];
     int len;
-
-    if (type == RBUS_ELEMENT_TYPE_METHOD)
-    {
-        Add_MethodToDM(instantiated_path, rdk_objects);
-        return;
-    }
 
     ConvertInstantiatedToSchemaPath(instantiated_path, schema_path, sizeof(schema_path));
 
